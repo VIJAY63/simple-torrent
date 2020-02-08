@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -11,12 +12,17 @@ import (
 	"github.com/mmcdole/gofeed"
 )
 
+var (
+	magnetExp = regexp.MustCompile(`magnet:[^< ]+`)
+)
+
 type rssJSONItem struct {
-	Name            string `json:"name,omitempty"`
-	Magnet          string `json:"magnet,omitempty"`
-	InfoHash        string `json:"hashinfo,omitempty"`
-	Published       string `json:"published,omitempty"`
-	URL             string `json:"url,omitempty"`
+	Name            string `json:"name"`
+	Magnet          string `json:"magnet"`
+	InfoHash        string `json:"hashinfo"`
+	Published       string `json:"published"`
+	URL             string `json:"url"`
+	Torrent         string `json:"torrent"`
 	publishedParsed *time.Time
 }
 
@@ -27,11 +33,9 @@ func (s *Server) updateRSS() {
 	}
 	for _, rss := range strings.Split(s.state.Config.RssURL, "\n") {
 		if !strings.HasPrefix(rss, "http://") && !strings.HasPrefix(rss, "https://") {
-			log.Printf("parse feed addr Invalid %s", rss)
 			continue
 		}
 		rss = strings.TrimSpace(rss)
-
 		feed, err := fp.ParseURL(rss)
 		if err != nil {
 			log.Printf("parse feed err %s", err.Error())
@@ -42,38 +46,44 @@ func (s *Server) updateRSS() {
 			log.Printf("retrived feed %s from %s", feed.Title, rss)
 		}
 
-		// sort the retrived feed by Published attr
-		// make sure the first is the latest
-		sort.Slice(feed.Items, func(i, j int) bool {
-			return feed.Items[i].PublishedParsed.After(*(feed.Items[j].PublishedParsed))
-		})
-
 		s.state.Lock()
-		if olditems, ok := s.state.rssCache[rss]; ok && len(olditems) > 0 {
+		if oldmark, ok := s.state.rssMark[rss]; ok {
 			var lastIdx int
 			for i, item := range feed.Items {
-				if item.GUID == olditems[0].GUID {
+				if item.GUID == oldmark {
 					lastIdx = i
 					break
 				}
 			}
 			if lastIdx > 0 {
 				log.Printf("feed updated with %d new items", lastIdx)
-				s.state.RSSNewCount += lastIdx
-				s.state.rssCache[rss] = append(feed.Items[:lastIdx], olditems...)
+				s.state.rssMark[rss] = feed.Items[0].GUID
+				s.state.rssCache = append(feed.Items[:lastIdx], s.state.rssCache...)
 			}
-		} else {
+		} else if len(feed.Items) > 0 {
 			if s.Debug {
 				log.Printf("retrive %d new items, first record", len(feed.Items))
 			}
-			s.state.rssCache[rss] = feed.Items
-			s.state.RSSNewCount += len(feed.Items)
+			s.state.rssMark[rss] = feed.Items[0].GUID
+			s.state.rssCache = append(feed.Items, s.state.rssCache...)
 		}
-		if len(s.state.rssCache[rss]) > 500 {
-			s.state.rssCache[rss] = s.state.rssCache[rss][:500]
+
+		if len(s.state.rssCache) > 200 {
+			s.state.rssCache = s.state.rssCache[:200]
 		}
 		s.state.Unlock()
 	}
+
+	s.state.Lock()
+	// sort the retrived feed by Published attr
+	// make sure the first is the latest
+	sort.Slice(s.state.rssCache, func(i, j int) bool {
+		return s.state.rssCache[i].PublishedParsed.After(*(s.state.rssCache[j].PublishedParsed))
+	})
+	if len(s.state.rssCache) > 0 {
+		s.state.LatestRSSGuid = s.state.rssCache[0].GUID
+	}
+	s.state.Unlock()
 }
 
 func (s *Server) serveRSS(w http.ResponseWriter, r *http.Request) {
@@ -82,54 +92,49 @@ func (s *Server) serveRSS(w http.ResponseWriter, r *http.Request) {
 		s.updateRSS()
 	}
 
-	s.state.Lock()
-	s.state.RSSNewCount = 0
-	s.state.Unlock()
-
 	var results []rssJSONItem
-	for _, rss := range strings.Split(s.state.Config.RssURL, "\n") {
-		if !strings.HasPrefix(rss, "http") {
-			continue
+	for _, i := range s.state.rssCache {
+		ritem := rssJSONItem{
+			Name:            i.Title,
+			Published:       i.Published,
+			URL:             i.Link,
+			publishedParsed: i.PublishedParsed,
 		}
-		rss = strings.TrimSpace(rss)
-		if items, ok := s.state.rssCache[rss]; ok {
-			for _, i := range items {
-				ritem := rssJSONItem{
-					Name:            i.Title,
-					Published:       i.Published,
-					URL:             i.Link,
-					publishedParsed: i.PublishedParsed,
-				}
 
-				// not sure which is the the torrent feed standard
-				// here is how to get magnet from struct of https://eztv.io/ezrss.xml
-				if etor, ok := i.Extensions["torrent"]; ok {
-					if e, ok := etor["magnetURI"]; ok && len(e) > 0 {
-						ritem.Magnet = e[0].Value
-					}
-					if e, ok := etor["infoHash"]; ok && len(e) > 0 {
-						ritem.InfoHash = e[0].Value
-					}
-				} else {
-					// some sites put it under enclosures
-					for _, e := range i.Enclosures {
-						if strings.HasPrefix(e.URL, "magnet:") {
-							ritem.Magnet = e.URL
-						}
-					}
-
-					if ritem.Magnet == "" {
-						ritem.Magnet = i.Link
-					}
+		// not sure which is the the torrent feed standard
+		// here is how to get magnet from struct of https://eztv.io/ezrss.xml
+		if etor, ok := i.Extensions["torrent"]; ok {
+			if e, ok := etor["magnetURI"]; ok && len(e) > 0 {
+				ritem.Magnet = e[0].Value
+			}
+			if e, ok := etor["infoHash"]; ok && len(e) > 0 {
+				ritem.InfoHash = e[0].Value
+			}
+		} else {
+			// some sites put it under enclosures
+			for _, e := range i.Enclosures {
+				if e.Type == "application/x-bittorrent" {
+					ritem.Torrent = e.URL
+					continue
 				}
-				results = append(results, ritem)
+				if strings.HasPrefix(e.URL, "magnet:") {
+					ritem.Magnet = e.URL
+				}
+			}
+
+			// find magnet in description
+			if s := magnetExp.FindString(i.Description); s != "" {
+				ritem.Magnet = s
+			}
+
+			// not found magnet/torrent, fallback to the link (likely not a magnet feed)
+			if ritem.Magnet == "" && ritem.InfoHash == "" && ritem.Torrent == "" {
+				ritem.Magnet = i.Link
 			}
 		}
+		results = append(results, ritem)
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].publishedParsed.After(*(results[j].publishedParsed))
-	})
 	b, err := json.Marshal(results)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

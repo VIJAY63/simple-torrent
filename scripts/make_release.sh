@@ -10,7 +10,8 @@ GITVER=$(git describe --tags)
 OS=""
 ARCH=""
 EXESUFFIX=""
-PKGCMD="gzip"
+PKGCMD=
+NOSTATIC=
 
 for arg in "$@"; do
 case $arg in
@@ -23,9 +24,12 @@ case $arg in
 		;;
 	xz)
 		PKGCMD=xz
-    ;;
-	nozip)
-		PKGCMD=
+    		;;
+	nostat)
+		NOSTATIC=1
+    		;;
+	gzip)
+		PKGCMD=gzip
 		;;
 esac
 done
@@ -39,6 +43,16 @@ if [[ -z $ARCH ]]; then
   ARCH=$(go env GOARCH)
 fi
 
+if [[ -z $NOSTATIC ]]; then
+	pushd $__dir/../static
+	if ! git diff-index --quiet HEAD . ; then
+	echo "Warning: static change and not commited"
+	exit 1
+	fi
+	sh generate.sh
+	popd
+fi
+
 pushd $__dir/..
 BINFILE=${BIN}_${OS}_${ARCH}${SUFFIX} 
 rm -fv ${BIN}_*
@@ -47,6 +61,8 @@ if [[ ! -f ${BINFILE}${EXESUFFIX} ]]; then
   echo "Build failed. Check with error message above."
   exit 1
 fi
+
+git co HEAD -- static/files.go
 
 if [[ ! -z $PKGCMD ]]; then
   ${PKGCMD} -v -9 -k ${BINFILE}${EXESUFFIX}

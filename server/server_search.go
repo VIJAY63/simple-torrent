@@ -8,22 +8,14 @@ import (
 	"net/http"
 )
 
-const (
-	searchConfigURL      = "https://gistcdn.githack.com/boypt/9bf0e3e876502ae8e521d9ba0487e0e1/raw/scraper-config.json"
-	searchConfigURLDebug = "https://gist.githubusercontent.com/boypt/9bf0e3e876502ae8e521d9ba0487e0e1/raw/scraper-config.json"
-)
-
 var fetches = 0
 var currentConfig, _ = normalize(defaultSearchConfig)
 
-func (s *Server) fetchSearchConfig() error {
-	confurl := searchConfigURL
-	if s.Debug {
-		confurl = searchConfigURLDebug
-	}
+func (s *Server) fetchSearchConfig(confurl string) error {
 	log.Println("fetchSearchConfig: loading search config from", confurl)
 	resp, err := http.Get(confurl)
 	if err != nil {
+		log.Println("[fetchSearchConfig]", err)
 		return err
 	}
 	defer resp.Body.Close()

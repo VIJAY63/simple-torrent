@@ -6,27 +6,42 @@ __root="$(cd "$(dirname "${__dir}")" && pwd)" # <-- change this as it depends on
 
 BUILDDIR=$__dir/build
 BIN=cloud-torrent
-GITVER=$(git describe --tags)
 mkdir -p $BUILDDIR
+GITVER=$(git describe --tags)
 
 makebuild () {
   local PREFIX=$1
   local OS=$2
   local ARCH=$3
-  local SUFFIX=${4:-}
+  local SUFFIX=
+  if [[ ${OS} == "windows" ]]; then
+    SUFFIX=".exe"
+  fi
   BINFILE=${BIN}_${OS}_${ARCH}${SUFFIX} 
-  CGO_ENABLED=0 GOARCH=$ARCH GOOS=$OS go build -o ${BUILDDIR}/${BINFILE} -ldflags "-s -w -X main.VERSION=$GITVER"
-  git checkout -- .
-  pushd ${BUILDDIR}
-  gzip -v -9 ${BINFILE}
+
+  if [[ ${ARCH} == "arm" ]]; then
+    for GM in 5 6 7; do
+      SUFFIX="_armv${GM}"
+      BINFILE=${BIN}_${OS}_${ARCH}${SUFFIX} 
+      CGO_ENABLED=0 GOARCH=$ARCH GOARM=${GM} GOOS=$OS go build -o ${BUILDDIR}/${BINFILE} -ldflags "-s -w -X main.VERSION=$GITVER"
+      pushd ${BUILDDIR}
+      gzip -v -9 ${BINFILE}
+      popd
+    done
+  else
+    CGO_ENABLED=0 GOARCH=$ARCH GOOS=$OS go build -o ${BUILDDIR}/${BINFILE} -ldflags "-s -w -X main.VERSION=$GITVER"
+    pushd ${BUILDDIR}
+    gzip -v -9 ${BINFILE}
+    popd
+  fi
+}
+
+upstatic () {
+  pushd $__dir/../static
+  env PATH=$HOME/go/bin:$PATH bash generate.sh
   popd
 }
 
-makebuild $BIN linux amd64
-makebuild $BIN linux 386
-makebuild $BIN linux arm
-makebuild $BIN linux arm64
-makebuild $BIN linux mipsle
-makebuild $BIN linux mips
-makebuild $BIN windows amd64 .exe
-makebuild $BIN windows 386 .exe
+upstatic
+makebuild $BIN $1 $2
+

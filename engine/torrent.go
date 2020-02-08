@@ -20,13 +20,16 @@ type Torrent struct {
 	Started       bool
 	Done          bool
 	DoneCmdCalled bool
+	IsDoneReady   bool
 	Percent       float32
 	DownloadRate  float32
 	UploadRate    float32
 	SeedRatio     float32
 	AddedAt       time.Time
+	StartedAt     time.Time
 	Stats         torrent.TorrentStats
 	t             *torrent.Torrent
+	dropWait      chan struct{}
 	updatedAt     time.Time
 }
 
@@ -34,21 +37,20 @@ type File struct {
 	//anacrolix/torrent
 	Path          string
 	Size          int64
-	Chunks        int
-	Completed     int
+	Completed     int64
 	Done          bool
 	DoneCmdCalled bool
 	//cloud torrent
 	Started bool
 	Percent float32
-	f       torrent.File
+	f       *torrent.File
 }
 
 // Update retrive info from torrent.Torrent
 func (torrent *Torrent) Update(t *torrent.Torrent) {
 	torrent.Name = t.Name()
-	torrent.Loaded = t.Info() != nil
-	if torrent.Loaded {
+	if t.Info() != nil {
+		torrent.Loaded = true
 		torrent.updateLoaded(t)
 	}
 	if torrent.Magnet == "" {
@@ -62,9 +64,6 @@ func (torrent *Torrent) Update(t *torrent.Torrent) {
 func (torrent *Torrent) updateLoaded(t *torrent.Torrent) {
 
 	torrent.Size = t.Length()
-	totalChunks := 0
-	totalCompleted := 0
-
 	tfiles := t.Files()
 	if len(tfiles) > 0 && torrent.Files == nil {
 		torrent.Files = make([]*File, len(tfiles))
@@ -74,26 +73,15 @@ func (torrent *Torrent) updateLoaded(t *torrent.Torrent) {
 		path := f.Path()
 		file := torrent.Files[i]
 		if file == nil {
-			file = &File{Path: path}
+			file = &File{Path: path, Started: torrent.Started}
 			torrent.Files[i] = file
 		}
-		chunks := f.State()
 
 		file.Size = f.Length()
-		file.Chunks = len(chunks)
-		completed := 0
-		for _, p := range chunks {
-			if p.Complete {
-				completed++
-			}
-		}
-		file.Completed = completed
-		file.Percent = percent(int64(file.Completed), int64(file.Chunks))
-		file.Done = (file.Completed == file.Chunks)
-		file.f = *f
-
-		totalChunks += file.Chunks
-		totalCompleted += file.Completed
+		file.Completed = f.BytesCompleted()
+		file.Percent = percent(file.Completed, file.Size)
+		file.Done = (file.Completed == file.Size)
+		file.f = f
 	}
 
 	torrent.Stats = t.Stats()
@@ -117,7 +105,7 @@ func (torrent *Torrent) updateLoaded(t *torrent.Torrent) {
 
 	torrent.updatedAt = now
 	torrent.Percent = percent(bytes, torrent.Size)
-	torrent.Done = (bytes == torrent.Size)
+	torrent.Done = t.BytesMissing() == 0
 
 	// calculate ratio
 	bRead := torrent.Stats.BytesReadData.Int64()

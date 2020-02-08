@@ -22,38 +22,61 @@ const (
 	cacheSavedPrefix = "_CLDAUTOSAVED_"
 )
 
-//the Engine Cloud Torrent engine, backed by anacrolix/torrent
-type Engine struct {
-	mut       sync.Mutex
-	cacheDir  string
-	client    *torrent.Client
-	config    Config
-	ts        map[string]*Torrent
-	bttracker []string
+type Server interface {
+	GetRestAPI() string
+	GetIsPendingBoot() bool
 }
 
-func New() *Engine {
-	return &Engine{ts: map[string]*Torrent{}}
+//the Engine Cloud Torrent engine, backed by anacrolix/torrent
+type Engine struct {
+	sync.RWMutex  // race condition on ts,client
+	cldServer     Server
+	cacheDir      string
+	client        *torrent.Client
+	closeSync     chan struct{}
+	config        Config
+	ts            map[string]*Torrent
+	bttracker     []string
+	doneThreshold time.Duration
+}
+
+func New(s Server) *Engine {
+	return &Engine{ts: make(map[string]*Torrent), cldServer: s}
 }
 
 func (e *Engine) Config() Config {
 	return e.config
 }
 
-func (e *Engine) Configure(c Config) error {
+func (e *Engine) SetConfig(c Config) {
+	e.config = c
+}
+
+func (e *Engine) Configure(c *Config) error {
 	//recieve config
-	if e.client != nil {
-		e.client.Close()
-		time.Sleep(1 * time.Second)
-	}
 	if c.IncomingPort <= 0 {
 		return fmt.Errorf("Invalid incoming port (%d)", c.IncomingPort)
 	}
+	if c.ScraperURL == "" {
+		c.ScraperURL = defaultScraperURL
+	}
+	if c.TrackerListURL == "" {
+		c.TrackerListURL = defaultTrackerListURL
+	}
+
+	if th, err := time.ParseDuration(c.DoneCmdThreshold); err == nil {
+		e.doneThreshold = th
+	} else {
+		return fmt.Errorf("fail to parse DoneCmdThreshold %w", err)
+	}
+
+	e.Lock()
+	defer e.Unlock()
 	tc := torrent.NewDefaultClientConfig()
 	tc.ListenPort = c.IncomingPort
 	tc.DataDir = c.DownloadDirectory
 	tc.Debug = c.EngineDebug
-	if e.config.MuteEngineLog {
+	if c.MuteEngineLog {
 		tc.Logger = eglog.Discard
 	}
 	tc.NoUpload = !c.EnableUpload
@@ -68,48 +91,86 @@ func (e *Engine) Configure(c Config) error {
 	tc.DisableIPv6 = c.DisableIPv6
 	tc.ProxyURL = c.ProxyURL
 
-	client, err := torrent.NewClient(tc)
-	if err != nil {
-		return err
+	{
+		if e.client != nil {
+			// stop all current torrents
+			for _, t := range e.client.Torrents() {
+				t.Drop()
+			}
+			e.client.Close()
+			close(e.closeSync)
+			log.Println("Configure: old client closed")
+			e.client = nil
+			e.ts = make(map[string]*Torrent)
+			time.Sleep(3 * time.Second)
+		}
+
+		// runtime reconfigure need to retry while creating client,
+		// wait max for 3 * 10 seconds
+		var err error
+		max := 10
+		for max > 0 {
+			max--
+			e.client, err = torrent.NewClient(tc)
+			if err == nil {
+				break
+			}
+			log.Printf("[Configure] error %s\n", err)
+			time.Sleep(time.Second * 3)
+		}
+		if err != nil {
+			return err
+		}
 	}
-	e.mut.Lock()
+
+	e.closeSync = make(chan struct{})
 	e.cacheDir = c.WatchDirectory
-	e.config = c
-	e.client = client
-	e.mut.Unlock()
-	//reset
-	e.GetTorrents()
+	e.config = *c
 	return nil
 }
 
+func (e *Engine) IsConfigred() bool {
+	e.RLock()
+	defer e.RUnlock()
+	return e.client != nil
+}
+
+// NewMagnet -> *Torrent -> addTorrentTask
 func (e *Engine) NewMagnet(magnetURI string) error {
+	e.RLock()
 	tt, err := e.client.AddMagnet(magnetURI)
 	if err != nil {
 		return err
 	}
-
+	e.RUnlock()
 	e.newMagnetCacheFile(magnetURI, tt.InfoHash().HexString())
-	return e.newTorrent(tt)
+	return e.addTorrentTask(tt)
 }
 
-func (e *Engine) NewTorrent(spec *torrent.TorrentSpec) error {
+// NewTorrentBySpec -> *Torrent -> addTorrentTask
+func (e *Engine) NewTorrentBySpec(spec *torrent.TorrentSpec) error {
+	e.RLock()
 	tt, _, err := e.client.AddTorrentSpec(spec)
 	if err != nil {
 		return err
 	}
-	return e.newTorrent(tt)
+	e.RUnlock()
+	return e.addTorrentTask(tt)
 }
 
-func (e *Engine) NewFileTorrent(path string) error {
+// NewTorrentByFilePath -> NewTorrentBySpec
+func (e *Engine) NewTorrentByFilePath(path string) error {
 	info, err := metainfo.LoadFromFile(path)
 	if err != nil {
 		return err
 	}
 	spec := torrent.TorrentSpecFromMetaInfo(info)
-	return e.NewTorrent(spec)
+	return e.NewTorrentBySpec(spec)
 }
 
-func (e *Engine) newTorrent(tt *torrent.Torrent) error {
+// addTorrentTask
+// add the task to local cache object and wait for GotInfo
+func (e *Engine) addTorrentTask(tt *torrent.Torrent) error {
 	meta := tt.Metainfo()
 	if len(e.bttracker) > 0 && (e.config.AlwaysAddTrackers || len(meta.AnnounceList) == 0) {
 		log.Printf("[newTorrent] added %d public trackers\n", len(e.bttracker))
@@ -117,7 +178,14 @@ func (e *Engine) newTorrent(tt *torrent.Torrent) error {
 	}
 	t := e.upsertTorrent(tt)
 	go func() {
-		<-t.t.GotInfo()
+		select {
+		case <-e.closeSync:
+			return
+		case <-t.dropWait:
+			return
+		case <-t.t.GotInfo():
+		}
+
 		e.removeMagnetCache(t.InfoHash)
 		if e.config.AutoStart {
 			e.StartTorrent(t.InfoHash)
@@ -128,70 +196,96 @@ func (e *Engine) newTorrent(tt *torrent.Torrent) error {
 	return nil
 }
 
-//GetTorrents moves torrents out of the anacrolix/torrent
-//and into the local cache
+//GetTorrents just get the local infohash->Torrent map
 func (e *Engine) GetTorrents() map[string]*Torrent {
-	e.mut.Lock()
-	defer e.mut.Unlock()
-
-	if e.client == nil {
-		return nil
-	}
-	for _, tt := range e.client.Torrents() {
-		t := e.upsertTorrent(tt)
-		e.torrentRoutine(t)
-	}
 	return e.ts
 }
 
-func (e *Engine) torrentRoutine(t *Torrent) {
+// TaskRoutine called by intevaled background goroutine
+// moves torrents out of the anacrolix/torrent and into the local cache
+// and do condition check and actions on them
+func (e *Engine) TaskRoutine() {
 
-	// stops task on reaching ratio
-	if e.config.SeedRatio > 0 &&
-		t.SeedRatio > e.config.SeedRatio &&
-		t.Started &&
-		t.Done {
-		log.Println("[Task Stoped] due to reaching SeedRatio")
-		go e.StopTorrent(t.InfoHash)
+	if e.client == nil {
+		return
 	}
 
-	// call DoneCmd on task completed
-	if t.Done && !t.DoneCmdCalled {
-		t.DoneCmdCalled = true
-		env := append(os.Environ(),
-			fmt.Sprintf("CLD_DIR=%s", e.config.DownloadDirectory),
-			fmt.Sprintf("CLD_PATH=%s", t.Name),
-			fmt.Sprintf("CLD_SIZE=%d", t.Size),
-			"CLD_TYPE=torrent",
-		)
-		go e.callDoneCmd(env)
-	}
+	for _, tt := range e.client.Torrents() {
 
-	// call DoneCmd on each file completed
-	// some file might finished before the whole task does
-	for _, f := range t.Files {
-		if f.Done && !f.DoneCmdCalled {
-			f.DoneCmdCalled = true
-			env := append(os.Environ(),
-				fmt.Sprintf("CLD_DIR=%s", e.config.DownloadDirectory),
-				fmt.Sprintf("CLD_PATH=%s", f.Path),
-				fmt.Sprintf("CLD_SIZE=%d", f.Size),
-				"CLD_TYPE=file",
-			)
-			go e.callDoneCmd(env)
+		// sync engine.Torrent to our Torrent struct
+		t := e.upsertTorrent(tt)
+
+		// stops task on reaching ratio
+		if e.config.SeedRatio > 0 &&
+			t.SeedRatio > e.config.SeedRatio &&
+			t.Started &&
+			t.Done {
+			log.Println("[Task Stoped] due to reaching SeedRatio")
+			go e.StopTorrent(t.InfoHash)
+		}
+
+		// task started in `DoneCmdThreshold` (default 30s), won't call the DoneCmd below
+		if !t.IsDoneReady {
+			if t.StartedAt.IsZero() {
+				continue
+			}
+
+			if time.Since(t.StartedAt) > e.doneThreshold && !t.Done {
+				// after 30s and task is not done yet, is ready for DoneCmd
+				t.IsDoneReady = true
+			}
+
+			continue
+		}
+
+		// call DoneCmd on task completed
+		if t.Done && !t.DoneCmdCalled {
+			t.DoneCmdCalled = true
+			go e.callDoneCmd(genEnv(e.config.DownloadDirectory,
+				t.Name, t.InfoHash, "torrent",
+				e.cldServer.GetRestAPI(), t.Size, t.StartedAt.Unix()))
+		}
+
+		// call DoneCmd on each file completed
+		// some files might finish before the whole task does
+		for _, f := range t.Files {
+			if f.Done && !f.DoneCmdCalled {
+				f.DoneCmdCalled = true
+				go e.callDoneCmd(genEnv(e.config.DownloadDirectory,
+					f.Path, "", "file",
+					e.cldServer.GetRestAPI(), f.Size, t.StartedAt.Unix()))
+			}
 		}
 	}
+}
+
+func genEnv(dir, path, hash, ttype, api string, size int64, ts int64) []string {
+	env := append(os.Environ(),
+		fmt.Sprintf("CLD_DIR=%s", dir),
+		fmt.Sprintf("CLD_PATH=%s", path),
+		fmt.Sprintf("CLD_HASH=%s", hash),
+		fmt.Sprintf("CLD_TYPE=%s", ttype),
+		fmt.Sprintf("CLD_RESTAPI=%s", api),
+		fmt.Sprintf("CLD_SIZE=%d", size),
+		fmt.Sprintf("CLD_STARTTS=%d", ts),
+	)
+	return env
 }
 
 func (e *Engine) upsertTorrent(tt *torrent.Torrent) *Torrent {
 	ih := tt.InfoHash().HexString()
+	e.RLock()
 	torrent, ok := e.ts[ih]
+	e.RUnlock()
 	if !ok {
 		torrent = &Torrent{
 			InfoHash: ih,
 			AddedAt:  time.Now(),
+			dropWait: make(chan struct{}),
 		}
+		e.Lock()
 		e.ts[ih] = torrent
+		e.Unlock()
 	}
 	//update torrent fields using underlying torrent
 	torrent.Update(tt)
@@ -199,6 +293,8 @@ func (e *Engine) upsertTorrent(tt *torrent.Torrent) *Torrent {
 }
 
 func (e *Engine) getTorrent(infohash string) (*Torrent, error) {
+	e.RLock()
+	defer e.RUnlock()
 	ih := metainfo.NewHashFromHex(infohash)
 	t, ok := e.ts[ih.HexString()]
 	if !ok {
@@ -207,16 +303,9 @@ func (e *Engine) getTorrent(infohash string) (*Torrent, error) {
 	return t, nil
 }
 
-func (e *Engine) getOpenTorrent(infohash string) (*Torrent, error) {
-	t, err := e.getTorrent(infohash)
-	if err != nil {
-		return nil, err
-	}
-	return t, nil
-}
-
 func (e *Engine) StartTorrent(infohash string) error {
-	t, err := e.getOpenTorrent(infohash)
+	log.Println("StartTorrent ", infohash)
+	t, err := e.getTorrent(infohash)
 	if err != nil {
 		return err
 	}
@@ -224,18 +313,26 @@ func (e *Engine) StartTorrent(infohash string) error {
 		return fmt.Errorf("Already started")
 	}
 	t.Started = true
+	t.StartedAt = time.Now()
 	for _, f := range t.Files {
 		if f != nil {
 			f.Started = true
 		}
 	}
 	if t.t.Info() != nil {
-		t.t.DownloadAll()
+		// start file by setting the priority
+		for _, f := range t.t.Files() {
+			f.SetPriority(torrent.PiecePriorityNormal)
+		}
+
+		// call to DownloadAll cause StartFile/StopFile not working
+		// t.t.DownloadAll()
 	}
 	return nil
 }
 
 func (e *Engine) StopTorrent(infohash string) error {
+	log.Println("StopTorrent ", infohash)
 	t, err := e.getTorrent(infohash)
 	if err != nil {
 		return err
@@ -257,11 +354,16 @@ func (e *Engine) StopTorrent(infohash string) error {
 }
 
 func (e *Engine) DeleteTorrent(infohash string) error {
+	log.Println("DeleteTorrent ", infohash)
 	t, err := e.getTorrent(infohash)
 	if err != nil {
 		return err
 	}
+
+	e.Lock()
+	close(t.dropWait)
 	delete(e.ts, t.InfoHash)
+	e.Unlock()
 
 	ih := metainfo.NewHashFromHex(infohash)
 	if tt, ok := e.client.Torrent(ih); ok {
@@ -274,7 +376,7 @@ func (e *Engine) DeleteTorrent(infohash string) error {
 }
 
 func (e *Engine) StartFile(infohash, filepath string) error {
-	t, err := e.getOpenTorrent(infohash)
+	t, err := e.getTorrent(infohash)
 	if err != nil {
 		return err
 	}
@@ -289,30 +391,69 @@ func (e *Engine) StartFile(infohash, filepath string) error {
 		return fmt.Errorf("Missing file %s", filepath)
 	}
 	if f.Started {
-		return fmt.Errorf("Already started")
+		return fmt.Errorf("already started")
 	}
 	t.Started = true
 	f.Started = true
-	f.f.Download()
+	f.f.SetPriority(torrent.PiecePriorityNormal)
 	return nil
 }
 
 func (e *Engine) StopFile(infohash, filepath string) error {
-	return fmt.Errorf("Unsupported")
+	t, err := e.getTorrent(infohash)
+	if err != nil {
+		return err
+	}
+	var f *File
+	for _, file := range t.Files {
+		if file.Path == filepath {
+			f = file
+			break
+		}
+	}
+	if f == nil {
+		return fmt.Errorf("Missing file %s", filepath)
+	}
+	if !f.Started {
+		return fmt.Errorf("already stopped")
+	}
+	f.Started = false
+	f.f.SetPriority(torrent.PiecePriorityNone)
+
+	allStopped := true
+	for _, file := range t.Files {
+		if file.Started {
+			allStopped = false
+			break
+		}
+	}
+
+	if allStopped {
+		e.StopTorrent(infohash)
+	}
+
+	return nil
 }
 
 func (e *Engine) callDoneCmd(env []string) {
 	if e.config.DoneCmd == "" {
 		return
 	}
+
+	if e.cldServer.GetIsPendingBoot() {
+		log.Println("[DoneCmd] program is pending boot, skiping")
+		return
+	}
+
 	cmd := exec.Command(e.config.DoneCmd)
 	cmd.Env = env
 	log.Printf("[DoneCmd] [%s] environ:%v", e.config.DoneCmd, cmd.Env)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Println("[DoneCmd] Err:", err)
+		return
 	}
-	log.Println("[DoneCmd] Output:", string(out))
+	log.Println("[DoneCmd] Exit:", cmd.ProcessState.ExitCode(), "Output:", string(out))
 }
 
 func (e *Engine) UpdateTrackers() error {
@@ -398,9 +539,15 @@ func (e *Engine) removeTorrentCache(infohash string) {
 		fmt.Sprintf("%s%s.torrent", cacheSavedPrefix, infohash))
 	if err := os.Remove(cacheFilePath); err == nil {
 		log.Printf("removed torrent file %s", infohash)
+	} else {
+		log.Printf("fail to removed torrent file %s, %s", infohash, err)
 	}
 }
 
 func (e *Engine) WriteStauts(_w io.Writer) {
-	e.client.WriteStatus(_w)
+	e.RLock()
+	defer e.RUnlock()
+	if e.client != nil {
+		e.client.WriteStatus(_w)
+	}
 }

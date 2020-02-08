@@ -1,6 +1,7 @@
 package server
 
 import (
+	"os"
 	"runtime"
 
 	velox "github.com/jpillora/velox/go"
@@ -44,4 +45,24 @@ func (s *stats) loadStats(diskDir string) {
 	//done
 	s.Set = true
 	s.pusher.Push()
+}
+
+func detectDiskStat(dir string) error {
+
+	if err := os.Mkdir(dir, os.ModePerm); err != nil {
+		if !os.IsExist(err) {
+			return err
+		}
+	}
+
+	stat, err := disk.Usage(dir)
+	if err != nil {
+		return err
+	}
+
+	if stat.Free < 10*1024*1024 {
+		return ErrDiskSpace
+	}
+
+	return nil
 }

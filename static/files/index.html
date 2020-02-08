@@ -29,23 +29,21 @@
 		<!-- TITLE ===================== -->
 		<div class="title">
 			<h2>
-				<a rel="noreferrer" href="https://github.com/boypt/simple-torrent" target="_blank" ng-init="logoHover = false"
-					ng-mouseover="logoHover = true" ng-mouseleave="logoHover = false">
+				<a rel="noreferrer" href="https://github.com/boypt/simple-torrent" target="_blank"
+					ng-init="logoHover = false" ng-mouseover="logoHover = true" ng-mouseleave="logoHover = false">
 					<i class="blue icon" ng-class="{cloud:!logoHover, github: logoHover}"></i> {{ state.Stats.Title }}
 				</a>
 			</h2>
 			<div class="status">
 				<i ng-show="request.count > 0" class="ui circular loading repeat icon"></i>
-				<i ng-click="$root.omni.get_rss(false)" class="ui circular rss square icon"
-				 	ng-class="{orange: state.RSSNewCount > 0 && !omni.mode.rss}" title="New RSS Item: {{state.RSSNewCount}}"></i>
-				<i ng-click="$root.config.edit = !$root.config.edit;" ng-class="{green: $root.config.edit}"
-					title="Edit Config"
+				<i ng-click="toggleSections('rss')" class="ui circular rss square icon"
+					ng-class="{orange: state.LatestRSSGuid != storage.tcRSSGUID, green: $root.omni.mode.rss }"
+					title="RSS List"></i>
+				<i ng-click="toggleSections('config')" ng-class="{green: $root.config.edit}" title="Edit Config"
 					class="ui circular server icon"></i>
-				<i ng-click="$root.omni.edit = !$root.omni.edit;" ng-class="{green: $root.omni.edit}"
-					title="Edit Magnet/Torrent"
+				<i ng-click="toggleSections('omni')" ng-class="{green: $root.omni.edit}" title="Edit Magnet/Torrent"
 					class="ui circular magnet icon"></i>
-				<i class="ui circular lightning icon"
-					title="Connecting Status"
+				<i class="ui circular lightning icon" title="Connecting Status"
 					ng-class="{ green: connected, red: !connected }"></i>
 			</div>
 		</div>
@@ -83,13 +81,7 @@
 			</div>
 			<div>
 				<span ng-if="state.Stats.System.set">
-					<span ng-click="$root.showEnineStatus = !$root.showEnineStatus">ShowDebugInfo,</span>
-					<span>
-						cpu {{ state.Stats.System.cpu | round }}%,
-					</span>
-					<span>
-						mem {{ state.Stats.System.memUsedPercent | round }}%,
-					</span>
+					<span ng-click="toggleSections('enginedebug')">ShowDebugInfo,</span>
 					<span>
 						disk {{ state.Stats.System.diskUsedPercent | round }}%,
 					</span>
@@ -97,12 +89,12 @@
 				<span ng-if="state.Stats.Uptime">up {{ ago(state.Stats.Uptime) }}</span>
 			</div>
 		</footer>
-		<div ng-if="$root.showEnineStatus" class="ui mini message">
+		<div ng-if="$root.showEnineStatus" class="ui attached mini message">
 			<i ng-click="$root.showEnineStatus = false" class="close icon"></i>
 			<div class="header">
-				Torrent Engine Info
+				System Info
 			</div>
-			<span ng-if="state.Stats.System.set">
+			<p ng-if="state.Stats.System.set">
 				<span>
 					goroutines {{ state.Stats.System.goRoutines }},
 				</span>
@@ -118,16 +110,20 @@
 				<span>
 					disk {{ state.Stats.System.diskUsedPercent | round }}%,
 				</span>
-			</span>
-			<span ng-if="state.Stats.Uptime">up {{ ago(state.Stats.Uptime) }}</span>
-			<pre>{{ $root.state.EngineStatus }}</pre>
-			<span ng-if="$root.state.EngineStatus.length === 0">Torrent Enging Bootstraping ...</span>
+				<span ng-if="state.Stats.Uptime">up {{ ago(state.Stats.Uptime) }}</span>
+			</p>
+			<div class="header">
+				Torrent Engine Status
+			</div>
+			<p>
+				<pre>{{ EngineStatus }}</pre>
+			</p>
 		</div>
 	</div>
 	<script src="js/vendor/query-string.js"></script>
 	<script src="js/vendor/angular.min.js"></script>
 	<script src="js/vendor/moment.min.js"></script>
-	<script src="js/velox.js"></script>
+	<script src="js/velox.js?CLDVER"></script>
 	<script>
 		window.app = window.angular.module('app', []);
 	</script>
@@ -139,4 +135,5 @@
 	<script src="js/semantic-checkbox.js?CLDVER"></script>
 	<script src="js/run.js?CLDVER"></script>
 </body>
+
 </html>

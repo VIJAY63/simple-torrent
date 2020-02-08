@@ -60,13 +60,7 @@ func (s *Server) serveFiles(w http.ResponseWriter, r *http.Request) {
 				a.AddDir(file)
 				a.Close()
 			} else {
-				f, err := os.Open(file)
-				if err != nil {
-					http.Error(w, "File open error: "+err.Error(), http.StatusBadRequest)
-					return
-				}
-				http.ServeContent(w, r, info.Name(), info.ModTime(), f)
-				f.Close()
+				http.ServeFile(w, r, file)
 			}
 		case "DELETE":
 			if err := os.RemoveAll(file); err != nil {
@@ -98,7 +92,7 @@ func list(path string, info os.FileInfo, node *fsNode, n *int) error {
 	}
 	children, err := ioutil.ReadDir(path)
 	if err != nil {
-		return fmt.Errorf("Failed to list files")
+		return fmt.Errorf("Failed to list files: %w", err)
 	}
 	node.Size = 0
 	for _, i := range children {
