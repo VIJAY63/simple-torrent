@@ -72,6 +72,8 @@ See Wiki [Config File](https://github.com/boypt/simple-torrent/wiki/Config-File)
 ## Use with WEB servers (nginx/caddy)
 See Wiki [Behind WebServer (reverse proxying)](https://github.com/boypt/simple-torrent/wiki/ReverseProxy)
 
+[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://gitlab.com/Vijay63/simple-torrent)
+
 # Credits 
 * Credits to @jpillora for [Cloud Torrent](https://github.com/jpillora/cloud-torrent).
 * Credits to @anacrolix for https://github.com/anacrolix/torrent
